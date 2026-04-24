@@ -7,12 +7,15 @@ error code so senders can cascade programmatically.
 
 ## Layout
 
-    server.py   — in-memory queue + axiom-checked router
-    worker.py   — polls server, reports tmux pane state, executes ops
-    client.py   — CLI submit with auto-cascade on rejection
-    axioms.py   — pure predicates, one per command family
-    proto.py    — framed-JSON TCP helpers (zero deps)
-    AXIOMS.md   — formal command algebra
+    server.py              — in-memory queue + axiom-checked router + ip gate
+    worker.py              — polls server, reports tmux pane state, executes ops
+    client.py              — CLI submit with auto-cascade on rejection
+    axioms.py              — pure predicates, one per command family
+    allowlist.py           — redux-style reducer + IP axioms + atomic JSON store
+    allowlist_server.py    — admin TCP server with allow/block/get ops
+    allowlist.seed.json    — initial allowed IPs (bootstrap only)
+    proto.py               — framed-JSON TCP helpers (zero deps)
+    AXIOMS.md              — formal command algebra
 
 ## Minimal use case
 
@@ -60,6 +63,27 @@ lands in a dedicated session:
 
 All command dispatch on the target happens through titled tmux panes per
 [this dev-rule](https://github.com/berstearns/all-my-tiny-projects/blob/main/claude-rules/dev-rules/any-terminal-command-must-be-run-through-tmux-target-a-specific-tmux-session-window-pane-and-create-it-if-not-exists.md).
+
+## IP allowlist
+
+All connections to the main queue are gated by a JSON allowlist at
+`TCPUX_ALLOWLIST_DB`. The file is maintained by `allowlist_server.py`,
+a separate TCP admin daemon with three ops:
+
+    allowlist_server.py allow 1.2.3.4     # move ip to allowed
+    allowlist_server.py block 1.2.3.4     # move ip to blocked
+    allowlist_server.py get                # dump current state
+
+Mutations are guarded by a shared `TCPUX_ADMIN_TOKEN`. The state is a
+redux-style reducer: every ALLOW moves an ip to `allowed` and removes it
+from `blocked`, and vice versa. Invariants (`allowed ∩ blocked = ∅`,
+every entry a valid IPv4) are re-checked on every reduce. See AXIOMS.md
+for the full axiom list.
+
+The queue deploy starts `allowlist_server.py serve` automatically in a
+dedicated tmux pane (`tcpux-queue-admin`). The db file is seeded from
+`allowlist.seed.json` only if it does not already exist on the target.
+Production ports and the admin token live in `deploy/.env` (gitignored).
 
 ## Env vars
 

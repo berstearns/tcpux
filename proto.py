@@ -1,5 +1,10 @@
 """Framed-JSON TCP protocol. Zero deps.
 
+Concurrency model: asyncio (server side) + blocking sockets (rpc client)
+Communication:     framed JSON bytes over TCP
+Cancellation:      per-connection task cancel; client uses socket timeout
+Shared state:      none — each connection owns its reader/writer pair
+
 Wire format: [4-byte big-endian length][JSON body]
 """
 import asyncio, json, socket, struct

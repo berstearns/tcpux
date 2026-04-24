@@ -1,5 +1,10 @@
 """tcpux worker — periodically reports tmux state to server and executes queued ops.
 
+Concurrency model: single-threaded polling loop (sync rpc calls)
+Communication:     framed-JSON over TCP via proto.rpc
+Cancellation:      KeyboardInterrupt / SIGINT
+Shared state:      none (all state is remote on the server)
+
 Loop:
   1. Sync local tmux state via `tmux list-panes -a -F ...`
   2. Send `tmux-panes-update` to server
@@ -80,7 +85,7 @@ def tmux_split_window(session, window):
 
 # ── op handlers — each returns {"ok": bool, ...} ────────────────
 
-def do_send_keys(pane_id, cmd):
+def run_send_keys(pane_id, cmd):
     fresh = list_panes().get(pane_id)
     if not fresh:
         return {"ok": False, "err": "pane vanished"}
@@ -93,7 +98,7 @@ def do_send_keys(pane_id, cmd):
     return {"ok": True, "pane": pane_id}
 
 
-def do_create_session(session):
+def run_create_session(session):
     try:
         tmux_new_session(session)
     except Exception as e:
@@ -101,7 +106,7 @@ def do_create_session(session):
     return {"ok": True, "session": session}
 
 
-def do_create_window(session, window):
+def run_create_window(session, window):
     try:
         tmux_new_window(session, window)
     except Exception as e:
@@ -109,9 +114,9 @@ def do_create_window(session, window):
     return {"ok": True, "window": f"{session}:{window}"}
 
 
-def do_create_pane(pane_id):
-    # tmux assigns pane indices — we can only ask to split. The next
-    # tmux-panes-update will reveal the actually-created pane_id.
+def run_create_pane(pane_id):
+    # tmux assigns pane indices — the next tmux-panes-update will reveal
+    # the actually-created pane_id.
     s, w, _ = pane_id.split(":", 2)
     try:
         tmux_split_window(s, w)
@@ -121,10 +126,10 @@ def do_create_pane(pane_id):
 
 
 HANDLERS = {
-    "send-keys":      lambda c: do_send_keys(c["pane"], c["cmd"]),
-    "create-session": lambda c: do_create_session(c["session"]),
-    "create-window":  lambda c: do_create_window(c["session"], c["window"]),
-    "create-pane":    lambda c: do_create_pane(c["pane"]),
+    "send-keys":      lambda c: run_send_keys(c["pane"], c["cmd"]),
+    "create-session": lambda c: run_create_session(c["session"]),
+    "create-window":  lambda c: run_create_window(c["session"], c["window"]),
+    "create-pane":    lambda c: run_create_pane(c["pane"]),
 }
 
 
@@ -134,10 +139,13 @@ def main():
     ap = argparse.ArgumentParser(description="tcpux worker")
     ap.add_argument("--name",  default=os.environ.get("TCPUX_WORKER", socket.gethostname()))
     ap.add_argument("--host",  default=os.environ.get("TCPUX_HOST", "127.0.0.1"))
-    ap.add_argument("--port",  type=int, default=int(os.environ.get("TCPUX_PORT", "9998")))
+    _p = os.environ.get("TCPUX_PORT")
+    ap.add_argument("--port",  type=int, default=int(_p) if _p else None)
     ap.add_argument("--poll",  type=float, default=float(os.environ.get("TCPUX_POLL",  "2")))
     ap.add_argument("--sync",  type=float, default=float(os.environ.get("TCPUX_SYNC",  "5")))
     args = ap.parse_args()
+    if args.port is None:
+        ap.error("--port required (or set TCPUX_PORT in env)")
 
     print(f"tcpux-worker '{args.name}' → {args.host}:{args.port} "
           f"(poll={args.poll}s sync={args.sync}s)", flush=True)

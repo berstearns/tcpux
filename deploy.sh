@@ -76,11 +76,23 @@ trap 'rm -f "$BUNDLE"' EXIT
 (cd "$SCRIPT_DIR" && tar -czf "$BUNDLE" \
     --exclude='.git' --exclude='__pycache__' --exclude='deploy' \
     axioms.py proto.py server.py worker.py client.py \
+    allowlist.py allowlist_server.py allowlist.seed.json \
     AXIOMS.md README.md)
 
 is_local() {
     [[ "$INSTANCE" == "local" || "$INSTANCE" == "localhost" || "$INSTANCE" == "127.0.0.1" ]]
 }
+
+# sshpass wrapper — if DO_PASS_FILE or ~/.do-pass exists, wrap ssh/scp.
+SSH_WRAP=()
+_pass_file=""
+[[ -n "${DO_PASS_FILE:-}" && -f "${DO_PASS_FILE:-}" ]] && _pass_file="$DO_PASS_FILE"
+[[ -z "$_pass_file" && -f "$HOME/.do-pass" ]] && _pass_file="$HOME/.do-pass"
+if [[ -n "$_pass_file" ]]; then
+    command -v sshpass >/dev/null || { echo "sshpass required for $_pass_file auth"; exit 1; }
+    SSH_WRAP=(sshpass -f "$_pass_file")
+    echo -e "${DIM}[auth] using sshpass + $_pass_file${NC}"
+fi
 
 if is_local; then
     echo -e "${DIM}[local] unpack → $REMOTE_ROOT${NC}"
@@ -91,13 +103,13 @@ if is_local; then
     bash "$REMOTE_SCRIPT" "$REMOTE_ROOT"
 else
     echo -e "${DIM}[ssh] scp bundle → $INSTANCE:/tmp/tcpux-bundle.tar.gz${NC}"
-    scp -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
+    "${SSH_WRAP[@]}" scp -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
         "$BUNDLE" "$INSTANCE:/tmp/tcpux-bundle.tar.gz"
-    scp -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
+    "${SSH_WRAP[@]}" scp -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
         "$ENV_FILE" "$INSTANCE:/tmp/tcpux.env"
     echo -e "${DIM}[ssh] pipe remote-$TYPE.sh${NC}"
     # Unpack and run the script on the target; pass install dir as $1.
-    ssh -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new "$INSTANCE" \
+    "${SSH_WRAP[@]}" ssh -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new "$INSTANCE" \
         "mkdir -p '$REMOTE_ROOT' && \
          tar -xzf /tmp/tcpux-bundle.tar.gz -C '$REMOTE_ROOT' && \
          mv /tmp/tcpux.env '$REMOTE_ROOT/.env' && \

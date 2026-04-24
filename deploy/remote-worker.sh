@@ -9,13 +9,16 @@ INSTALL="${1:?install dir required}"
 cd "$INSTALL"
 set -o allexport; . ./.env; set +o allexport
 
+: "${TCPUX_PORT:?set in deploy/.env}"
+
 SESSION="${WORKER_SESSION:-tcpux-worker}"
 WINDOW="${WORKER_WINDOW:-worker}"
 P_MAIN="${WORKER_PANE_MAIN:-tcpux-worker-main}"
 P_OBS="${WORKER_PANE_OBS:-tcpux-worker-obs}"
 NAME="${WORKER_NAME:-worker1}"
-HOST="${TCPUX_HOST:-127.0.0.1}"
-PORT="${TCPUX_PORT:-9998}"
+# Workers dial the queue locally (same host); never use the bind address.
+HOST="127.0.0.1"
+PORT="${TCPUX_PORT}"
 PY="${PYTHON:-python3}"
 SHELL_NAMES='^(bash|zsh|fish|sh|dash|tcsh|ksh)$'
 
@@ -43,7 +46,7 @@ tmux select-pane -t "$SESSION:$WINDOW.$first_idx" -T "$P_MAIN"
 cur=$(tmux display-message -p -t "$SESSION:$WINDOW.$first_idx" '#{pane_current_command}')
 if [[ "$cur" =~ $SHELL_NAMES ]]; then
     tmux send-keys -t "$SESSION:$WINDOW.$first_idx" \
-        "cd $INSTALL && $PY worker.py --name $NAME --host $HOST --port $PORT" Enter
+        "cd $INSTALL && set -o allexport && source .env && set +o allexport && $PY worker.py --name $NAME --host $HOST" Enter
     say "started worker in pane $P_MAIN"
 else
     say "pane $P_MAIN busy ($cur) — leaving alone"

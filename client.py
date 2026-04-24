@@ -14,97 +14,88 @@ Timing: creation ops are queued for the worker, so we wait for the
 worker's next `tmux-panes-update` to observe the new state before the
 retry. `--wait` bounds that polling loop.
 """
-import argparse, json, os, socket, sys, time
+import argparse, json, os, sys, time
 
 from proto import rpc
 
 
-def _call(host, port, msg):
-    return rpc(host, port, msg)
-
-
 def _state(host, port, worker):
-    s = _call(host, port, {"op": "state"})
+    s = rpc(host, port, {"op": "state"})
     return s.get("state", {}).get(worker, {}).get("panes", {})
 
 
-def _wait_for_pane(host, port, worker, pane_id, timeout):
+def _wait_until(host, port, worker, pred, timeout):
+    """Poll worker's pane set until `pred(panes)` is truthy or deadline hits."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if pane_id in _state(host, port, worker):
+        if pred(_state(host, port, worker)):
             return True
         time.sleep(1)
     return False
+
+
+def _wait_for_pane(host, port, worker, pane_id, timeout):
+    return _wait_until(host, port, worker, lambda panes: pane_id in panes, timeout)
 
 
 def _wait_for_window(host, port, worker, session, window, timeout):
     prefix = f"{session}:{window}:"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        panes = _state(host, port, worker)
-        if any(p.startswith(prefix) for p in panes):
-            return True
-        time.sleep(1)
-    return False
+    def pred(panes): return any(p.startswith(prefix) for p in panes)
+    return _wait_until(host, port, worker, pred, timeout)
 
 
 def _wait_for_session(host, port, worker, session, timeout):
     prefix = f"{session}:"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        panes = _state(host, port, worker)
-        if any(p.startswith(prefix) for p in panes):
-            return True
-        time.sleep(1)
-    return False
+    def pred(panes): return any(p.startswith(prefix) for p in panes)
+    return _wait_until(host, port, worker, pred, timeout)
 
 
 def cascade_create(host, port, worker, pane_id, wait):
     """Build session → window → pane until `pane_id`'s window exists."""
     session, window, _pane = pane_id.split(":", 2)
 
-    r = _call(host, port, {"op": "create-pane", "worker": worker, "pane": pane_id})
+    r = rpc(host, port, {"op": "create-pane", "worker": worker, "pane": pane_id})
     if r.get("ok"):
         print(f"  create-pane queued #{r['id']}")
         return r
 
     code = r.get("err_code", "")
     if code == "CP2_WINDOW_MISSING":
-        rw = _call(host, port, {"op": "create-window", "worker": worker,
-                                 "session": session, "window": window})
+        rw = rpc(host, port, {"op": "create-window", "worker": worker,
+                               "session": session, "window": window})
         if rw.get("ok"):
             print(f"  create-window queued #{rw['id']}")
             if not _wait_for_window(host, port, worker, session, window, wait):
                 return {"ok": False, "err_code": "TIMEOUT",
                         "hint": f"window {session}:{window} did not appear in {wait}s"}
-            return _call(host, port, {"op": "create-pane", "worker": worker, "pane": pane_id})
+            return rpc(host, port, {"op": "create-pane", "worker": worker, "pane": pane_id})
         if rw.get("err_code") != "CW1_SESSION_MISSING":
             return rw
         code = "CP2_SESSION_MISSING"
 
     if code == "CP2_SESSION_MISSING":
-        rs = _call(host, port, {"op": "create-session", "worker": worker, "session": session})
+        rs = rpc(host, port, {"op": "create-session", "worker": worker, "session": session})
         if not rs.get("ok"):
             return rs
         print(f"  create-session queued #{rs['id']}")
         if not _wait_for_session(host, port, worker, session, wait):
             return {"ok": False, "err_code": "TIMEOUT",
                     "hint": f"session {session} did not appear in {wait}s"}
-        rw = _call(host, port, {"op": "create-window", "worker": worker,
-                                 "session": session, "window": window})
+        rw = rpc(host, port, {"op": "create-window", "worker": worker,
+                               "session": session, "window": window})
         if rw.get("ok"):
             print(f"  create-window queued #{rw['id']}")
             if not _wait_for_window(host, port, worker, session, window, wait):
                 return {"ok": False, "err_code": "TIMEOUT",
                         "hint": f"window {session}:{window} did not appear in {wait}s"}
-        return _call(host, port, {"op": "create-pane", "worker": worker, "pane": pane_id})
+        return rpc(host, port, {"op": "create-pane", "worker": worker, "pane": pane_id})
 
     return r
 
 
 def send_keys(host, port, worker, pane, cmd, cascade, wait):
     msg = {"op": "send-keys", "worker": worker, "pane": pane, "cmd": cmd}
-    r = _call(host, port, msg)
+    r = rpc(host, port, msg)
     if r.get("ok"):
         print(f"send-keys queued #{r['id']}")
         return r
@@ -126,7 +117,7 @@ def send_keys(host, port, worker, pane, cmd, cascade, wait):
             return {"ok": False, "err_code": "CASCADE_INDEX_MISMATCH",
                     "hint": "created pane but index did not match — retry with an existing pane id"}
         print(f"  retrying send-keys…")
-        return _call(host, port, msg)
+        return rpc(host, port, msg)
     return r
 
 
@@ -136,7 +127,8 @@ def main():
     ap.add_argument("-p", "--pane",   help="target pane (session:window:pane)")
     ap.add_argument("-c", "--cmd",    help="command to send-keys into the pane")
     ap.add_argument("--host",  default=os.environ.get("TCPUX_HOST", "127.0.0.1"))
-    ap.add_argument("--port",  type=int, default=int(os.environ.get("TCPUX_PORT", "9998")))
+    _p = os.environ.get("TCPUX_PORT")
+    ap.add_argument("--port",  type=int, default=int(_p) if _p else None)
     ap.add_argument("--no-cascade", action="store_true",
                     help="disable auto-cascade to create-pane on SK3 rejection")
     ap.add_argument("--wait",  type=float, default=30.0,
@@ -148,6 +140,8 @@ def main():
     ap.add_argument("--window",  help="window id for create-window")
     ap.add_argument("--id",      type=int, help="command id for --op status")
     args = ap.parse_args()
+    if args.port is None:
+        ap.error("--port required (or set TCPUX_PORT in env)")
 
     if args.op == "send-keys":
         if not args.pane or not args.cmd:
@@ -155,19 +149,19 @@ def main():
         r = send_keys(args.host, args.port, args.worker, args.pane, args.cmd,
                       cascade=not args.no_cascade, wait=args.wait)
     elif args.op == "create-pane":
-        r = _call(args.host, args.port,
-                  {"op": "create-pane", "worker": args.worker, "pane": args.pane})
+        r = rpc(args.host, args.port,
+                {"op": "create-pane", "worker": args.worker, "pane": args.pane})
     elif args.op == "create-window":
-        r = _call(args.host, args.port,
-                  {"op": "create-window", "worker": args.worker,
-                   "session": args.session, "window": args.window})
+        r = rpc(args.host, args.port,
+                {"op": "create-window", "worker": args.worker,
+                 "session": args.session, "window": args.window})
     elif args.op == "create-session":
-        r = _call(args.host, args.port,
-                  {"op": "create-session", "worker": args.worker, "session": args.session})
+        r = rpc(args.host, args.port,
+                {"op": "create-session", "worker": args.worker, "session": args.session})
     elif args.op == "state":
-        r = _call(args.host, args.port, {"op": "state"})
+        r = rpc(args.host, args.port, {"op": "state"})
     elif args.op == "status":
-        r = _call(args.host, args.port, {"op": "status", "id": args.id})
+        r = rpc(args.host, args.port, {"op": "status", "id": args.id})
     else:
         r = {"ok": False, "err": "unknown op"}
 

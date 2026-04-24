@@ -88,6 +88,49 @@ Effect on success: `QUEUE[worker_id] ← QUEUE[worker_id] · ⟨send-keys pane c
 |---|---|---|
 | A1 | `cmd_id` was dispatched | `A1_UNKNOWN_CMD` |
 
+### N — network-layer ip gate (checked on every frame by the main server)
+
+The queue server reads `TCPUX_ALLOWLIST_DB` (a JSON file maintained by
+`allowlist_server.py`). Ip-gate runs before any op-specific axiom.
+
+| # | axiom | err_code |
+|---|---|---|
+| N1 | db file exists | `N1_DB_MISSING` |
+| N1 | db file parses + invariants hold | `N1_DB_INVALID` |
+| N1 | source ip ∉ blocked | `N1_IP_BLOCKED` |
+| N1 | source ip ∈ allowed | `N1_IP_NOT_ALLOWED` |
+
+If `TCPUX_ALLOWLIST_DB` is unset the gate is disabled (dev mode) and a
+warning is logged once. Production deploys must set it.
+
+## Allowlist reducer (redux-style)
+
+The allowlist itself is a pure reducer with two single-entrypoint actions:
+
+    {"type": "ALLOW", "ip": "<ipv4>"}  → ensure ip ∈ allowed, ip ∉ blocked
+    {"type": "BLOCK", "ip": "<ipv4>"}  → ensure ip ∈ blocked, ip ∉ allowed
+
+Reducer axioms:
+
+| # | axiom | err_code |
+|---|---|---|
+| N1 | ip matches `[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}` | `N1_BAD_IP` |
+| N2 | `action.type ∈ {ALLOW, BLOCK}` | `N2_BAD_ACTION` |
+
+Invariants re-checked after every reduce (any failure raises, never
+persists stale state):
+
+| # | invariant | err_code |
+|---|---|---|
+| I1 | `allowed ∩ blocked = ∅` | `I1_OVERLAP` |
+| I2 | every element of `allowed ∪ blocked` satisfies N1 | `I2_BAD_IP` |
+
+Mutations flow through `allowlist_server.py` (TCP, framed JSON). Auth is
+a shared `TCPUX_ADMIN_TOKEN` compared with `hmac.compare_digest`. The
+read op `get` is unauthenticated so the main server and operators can
+smoke-test the db. Writes are atomic via `os.replace(tmp, db)` and the
+main server's read-cache invalidates on mtime change.
+
 ## Induced rule: the cascade ladder
 
 When a sender receives `SK3_PANE_NOT_EXIST`, the induced strategy is:
