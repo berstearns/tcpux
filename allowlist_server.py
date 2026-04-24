@@ -36,7 +36,9 @@ def _req_env(name):
 
 HOST  = os.environ.get("TCPUX_HOST", "0.0.0.0")
 PORT  = int(_req_env("TCPUX_ADMIN_PORT"))
-DB    = _req_env("TCPUX_ALLOWLIST_DB")
+# DB is only needed for `serve` mode. CLI client modes (allow/block/get)
+# are pure TCP and never touch the file.
+DB    = os.environ.get("TCPUX_ALLOWLIST_DB", "")
 TOKEN = os.environ.get("TCPUX_ADMIN_TOKEN", "")
 
 
@@ -113,6 +115,8 @@ def _evt(kind, **kv):
 
 
 async def _main_serve():
+    if not DB:
+        raise SystemExit("TCPUX_ALLOWLIST_DB must be set for serve mode")
     print(f"""
 {C['cyan']}{C['bold']}╔══════════════════════════════════════════╗
 ║   TCPUX ALLOWLIST ADMIN (redux reducer)  ║

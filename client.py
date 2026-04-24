@@ -51,8 +51,17 @@ def _wait_for_session(host, port, worker, session, timeout):
 
 
 def cascade_create(host, port, worker, pane_id, wait):
-    """Build session → window → pane until `pane_id`'s window exists."""
+    """Build session → window → pane until `pane_id` is present in worker state.
+
+    Tmux's `new-session` / `new-window` auto-create a default pane at
+    window:0 pane:0, so after each construction step we re-check whether
+    the target pane is already present (then we're done) before falling
+    through to the next construction op.
+    """
     session, window, _pane = pane_id.split(":", 2)
+
+    if pane_id in _state(host, port, worker):
+        return {"ok": True, "note": "pane already present"}
 
     r = rpc(host, port, {"op": "create-pane", "worker": worker, "pane": pane_id})
     if r.get("ok"):
@@ -60,37 +69,35 @@ def cascade_create(host, port, worker, pane_id, wait):
         return r
 
     code = r.get("err_code", "")
-    if code == "CP2_WINDOW_MISSING":
-        rw = rpc(host, port, {"op": "create-window", "worker": worker,
-                               "session": session, "window": window})
-        if rw.get("ok"):
-            print(f"  create-window queued #{rw['id']}")
-            if not _wait_for_window(host, port, worker, session, window, wait):
-                return {"ok": False, "err_code": "TIMEOUT",
-                        "hint": f"window {session}:{window} did not appear in {wait}s"}
-            return rpc(host, port, {"op": "create-pane", "worker": worker, "pane": pane_id})
-        if rw.get("err_code") != "CW1_SESSION_MISSING":
-            return rw
-        code = "CP2_SESSION_MISSING"
 
     if code == "CP2_SESSION_MISSING":
         rs = rpc(host, port, {"op": "create-session", "worker": worker, "session": session})
-        if not rs.get("ok"):
+        if not rs.get("ok") and rs.get("err_code") != "CS2_SESSION_EXISTS":
             return rs
-        print(f"  create-session queued #{rs['id']}")
+        print(f"  create-session queued #{rs.get('id', '-')}")
         if not _wait_for_session(host, port, worker, session, wait):
             return {"ok": False, "err_code": "TIMEOUT",
                     "hint": f"session {session} did not appear in {wait}s"}
-        rw = rpc(host, port, {"op": "create-window", "worker": worker,
-                               "session": session, "window": window})
-        if rw.get("ok"):
-            print(f"  create-window queued #{rw['id']}")
-            if not _wait_for_window(host, port, worker, session, window, wait):
-                return {"ok": False, "err_code": "TIMEOUT",
-                        "hint": f"window {session}:{window} did not appear in {wait}s"}
-        return rpc(host, port, {"op": "create-pane", "worker": worker, "pane": pane_id})
+        if pane_id in _state(host, port, worker):
+            return {"ok": True, "note": "satisfied by default pane of new session"}
+        code = "CP2_WINDOW_MISSING"
 
-    return r
+    if code == "CP2_WINDOW_MISSING":
+        rw = rpc(host, port, {"op": "create-window", "worker": worker,
+                              "session": session, "window": window})
+        if not rw.get("ok") and rw.get("err_code") != "CW2_WINDOW_EXISTS":
+            return rw
+        print(f"  create-window queued #{rw.get('id', '-')}")
+        if not _wait_for_window(host, port, worker, session, window, wait):
+            return {"ok": False, "err_code": "TIMEOUT",
+                    "hint": f"window {session}:{window} did not appear in {wait}s"}
+        if pane_id in _state(host, port, worker):
+            return {"ok": True, "note": "satisfied by default pane of new window"}
+
+    rp = rpc(host, port, {"op": "create-pane", "worker": worker, "pane": pane_id})
+    if rp.get("ok") or rp.get("err_code") == "CP3_PANE_EXISTS":
+        return {"ok": True, "id": rp.get("id"), "note": rp.get("err_code")}
+    return rp
 
 
 def send_keys(host, port, worker, pane, cmd, cascade, wait):
