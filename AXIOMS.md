@@ -1,0 +1,115 @@
+# tcpux — command algebra
+
+tcpux accepts **only** commands that satisfy a fixed set of axioms. Every
+rejection carries a stable `err_code` so the sender can react mechanically
+(usually by cascading to a construction command).
+
+## Alphabet
+
+    IDENT    := [A-Za-z0-9_-]+
+    PANE_ID  := IDENT ":" IDENT ":" IDENT       -- session:window:pane
+    WIN_ID   := IDENT ":" IDENT                 -- session:window
+
+`session`, `window`, `pane` are strings. `window` and `pane` map to tmux
+indices when the worker executes. Pane indices are assigned by tmux, not
+by the sender.
+
+## State
+
+    STATE : WORKER_ID ⇀ { panes : PANE_ID ⇀ PaneState, last_update : ℝ }
+    QUEUE : WORKER_ID ⇀ Seq⟨Command⟩
+    PaneState = { busy : 𝔹, cmd : str, pid : str, logs : [..] }
+
+A worker becomes *registered* the first time it issues
+`tmux-panes-update`.
+
+## Commands and their axioms
+
+### U — `tmux-panes-update` (worker → server)
+
+| # | axiom | err_code |
+|---|---|---|
+| U1 | `worker_id ∈ IDENT` | `U1_BAD_WORKER_ID` |
+| U2 | `panes` is a dict, every key matches `PANE_ID` | `U2_PANES_NOT_DICT` / `U2_BAD_PANE_ID` |
+| U3 | every value has `busy : bool` | `U3_BAD_PANE_STATE` |
+
+Effect on success: `STATE[worker_id].panes ← panes`.
+
+### SK — `send-keys` (client → server → queue)
+
+| # | axiom | err_code |
+|---|---|---|
+| SK1 | `worker_id ∈ IDENT` and registered | `SK1_BAD_WORKER_ID` / `SK1_WORKER_UNKNOWN` |
+| SK2 | `pane_id ∈ PANE_ID` (grammar) | `SK2_BAD_PANE_ID` |
+| SK3 | `pane_id ∈ dom(STATE[worker_id].panes)` | `SK3_PANE_NOT_EXIST` |
+| SK4 | `cmd` is a non-empty string | `SK4_BAD_CMD` |
+| SK5 | `¬ STATE[worker_id].panes[pane_id].busy` | `SK5_PANE_BUSY` |
+
+Uniqueness & unambiguity of SK3 are free: the pane set is a map keyed by
+the canonical `PANE_ID`, so presence is a single dictionary lookup.
+
+Effect on success: `QUEUE[worker_id] ← QUEUE[worker_id] · ⟨send-keys pane cmd⟩`.
+
+### CS — `create-session`
+
+| # | axiom | err_code |
+|---|---|---|
+| CS0 | worker registered | `CS0_WORKER_UNKNOWN` |
+| CS1 | `session ∈ IDENT` | `CS1_BAD_SESSION` |
+| CS2 | `session ∉` existing sessions of worker | `CS2_SESSION_EXISTS` |
+
+### CW — `create-window`
+
+| # | axiom | err_code |
+|---|---|---|
+| CW0 | worker registered | `CW0_WORKER_UNKNOWN` |
+| CW1 | session & window ∈ IDENT; session exists | `CW1_BAD_IDENT` / `CW1_SESSION_MISSING` |
+| CW2 | `session:window ∉` existing windows | `CW2_WINDOW_EXISTS` |
+
+### CP — `create-pane`
+
+| # | axiom | err_code |
+|---|---|---|
+| CP0 | worker registered | `CP0_WORKER_UNKNOWN` |
+| CP1 | `pane_id ∈ PANE_ID` | `CP1_BAD_PANE_ID` |
+| CP2 | `session` exists | `CP2_SESSION_MISSING` |
+| CP2 | `session:window` exists | `CP2_WINDOW_MISSING` |
+| CP3 | `pane_id ∉` existing panes | `CP3_PANE_EXISTS` |
+
+### P — `poll` (worker → server)
+
+| # | axiom | err_code |
+|---|---|---|
+| P1 | `worker_id ∈ IDENT` | `P1_BAD_WORKER_ID` |
+
+### A — `ack`
+
+| # | axiom | err_code |
+|---|---|---|
+| A1 | `cmd_id` was dispatched | `A1_UNKNOWN_CMD` |
+
+## Induced rule: the cascade ladder
+
+When a sender receives `SK3_PANE_NOT_EXIST`, the induced strategy is:
+
+    try create-pane(pane_id)
+      if CP2_WINDOW_MISSING   → create-window(session, window)
+        if CW1_SESSION_MISSING → create-session(session)
+      retry create-pane(pane_id)
+    wait for tmux-panes-update to reflect the new pane
+    retry send-keys
+
+Each step is itself strictly axiomatic, so the cascade terminates in at
+most three construction ops before the ladder is built. Because tmux
+assigns pane indices, the actual created `pane_id` may differ from the
+requested one; the sender must re-read state after the update.
+
+## Design constraints
+
+- **No coercion.** The server never "fixes up" a bad request. Every
+  rejection names an axiom.
+- **Single dispatch.** A command belongs to exactly one worker's queue.
+- **In-memory only.** STATE and QUEUE do not persist across restarts.
+  The first `tmux-panes-update` from each worker rebuilds STATE.
+- **Busy-awareness is authoritative on the worker.** The server's busy
+  flag is best-effort; the worker rechecks before pressing keys.
