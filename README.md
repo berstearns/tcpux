@@ -42,6 +42,25 @@ tmux auto-assigns pane indices, so the actually created `pane_id` may
 differ from the requested one. The client prints the current pane set
 for the worker in that case, and the sender retries with a real id.
 
+## Deploy
+
+`deploy.sh` ships the source + a config dir to a target instance (local
+or SSH) and starts queue/worker inside canonical tmux panes:
+
+    ./deploy.sh -c deploy/ -t queue  -i local
+    ./deploy.sh -c deploy/ -t worker -i local
+    ./deploy.sh -c deploy/ -t queue  -i root@1.2.3.4
+
+`deploy/.env` (gitignored; template in `deploy/.env.example`) drives the
+session/window/pane titles, TCP host/port, and install root. Each type
+lands in a dedicated session:
+
+    queue  → session `tcpux-queue`  / window `queue`  / panes `tcpux-queue-server`  + `tcpux-queue-state`
+    worker → session `tcpux-worker` / window `worker` / panes `tcpux-worker-main`   + `tcpux-worker-obs`
+
+All command dispatch on the target happens through titled tmux panes per
+[this dev-rule](https://github.com/berstearns/all-my-tiny-projects/blob/main/claude-rules/dev-rules/any-terminal-command-must-be-run-through-tmux-target-a-specific-tmux-session-window-pane-and-create-it-if-not-exists.md).
+
 ## Env vars
 
 | var | default | who |
