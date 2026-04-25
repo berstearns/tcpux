@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+#===============================================================================
+# tcpux — thin wrapper for the client tools. Sources deploy/.env and dispatches
+#         to client.py (queue ops) or allowlist_server.py (allow/block/get).
+#
+# Usage:
+#   ./tcpux -w worker1 -p session:win:pane -c 'echo hi'   # send-keys (default)
+#   ./tcpux -w worker1 --op state                         # read server state
+#   ./tcpux allow 1.2.3.4                                 # allowlist admin
+#   ./tcpux block 1.2.3.4
+#   ./tcpux get
+#===============================================================================
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$HERE/deploy/.env"
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE — cp deploy/.env.example deploy/.env and fill in"; exit 1; }
+
+set -o allexport; . "$ENV_FILE"; set +o allexport
+
+case "${1:-}" in
+  allow|block|get)
+    exec python3 "$HERE/allowlist_server.py" "$@"
+    ;;
+  shortcut|sc)
+    # ./tcpux shortcut set NAME -w WORKER -p PANE [--force]
+    # ./tcpux shortcut del NAME
+    # ./tcpux shortcut ls
+    shift
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      set)
+        name="${1:-}"; shift || true
+        exec python3 "$HERE/client.py" --op shortcut-set --name "$name" "$@"
+        ;;
+      del|rm)
+        name="${1:-}"; shift || true
+        exec python3 "$HERE/client.py" --op shortcut-del --name "$name" "$@"
+        ;;
+      ls|list)
+        # pretty-print shortcuts
+        PYTHONPATH="$HERE" exec python3 - <<'PY'
+import os, sys
+from proto import rpc
+host = os.environ["TCPUX_HOST"]; port = int(os.environ["TCPUX_PORT"])
+r = rpc(host, port, {"op":"shortcut-list"})
+sc = r.get("shortcuts", {})
+if not sc:
+    print("(no shortcuts)"); sys.exit(0)
+B, D, X = "\033[1m", "\033[2m", "\033[0m"
+w = max(len(n) for n in sc)
+for name in sorted(sc):
+    s = sc[name]
+    print(f"  {B}{name:<{w}}{X}  →  {s['worker']}/{s['pane']}")
+PY
+        ;;
+      *)
+        echo "usage: ./tcpux shortcut {set NAME -w W -p P [--force] | del NAME | ls}"
+        exit 1
+        ;;
+    esac
+    ;;
+  list|ls)
+    shift
+    # Pretty-print workers and their panes. Optional positional arg = worker filter.
+    PYTHONPATH="$HERE" exec python3 - "${1:-}" <<'PY'
+import json, os, sys
+from proto import rpc
+host = os.environ["TCPUX_HOST"]; port = int(os.environ["TCPUX_PORT"])
+filt = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
+r = rpc(host, port, {"op": "state"})
+state = r.get("state", {})
+queue = r.get("queue", {})
+if not state:
+    print("(no workers registered)"); sys.exit(0)
+G, Y, R, D, B, X = "\033[32m","\033[33m","\033[31m","\033[2m","\033[1m","\033[0m"
+for w in sorted(state):
+    if filt and w != filt: continue
+    panes = state[w].get("panes", {})
+    pending = len(queue.get(w, []))
+    print(f"{B}{w}{X}  {D}({len(panes)} panes, {pending} queued){X}")
+    for pid in sorted(panes):
+        p = panes[pid]
+        flag = f"{Y}busy{X}" if p.get("busy") else f"{G}idle{X}"
+        cmd = p.get("cmd","?")
+        print(f"  {pid:<48} [{flag}] {cmd}")
+PY
+    ;;
+  -h|--help|"")
+    python3 "$HERE/client.py" --help
+    echo
+    echo "wrapper shortcuts:"
+    echo "  ./tcpux list [worker]            pretty-print workers and their panes"
+    echo "  ./tcpux ls   [worker]            alias for list"
+    echo "  ./tcpux shortcut set NAME -w W -p P [--force]"
+    echo "  ./tcpux shortcut del NAME"
+    echo "  ./tcpux shortcut ls              list registered shortcuts"
+    echo "  ./tcpux -s NAME -c 'cmd'         send-keys via shortcut"
+    echo "  ./tcpux allow <ip>               add ip to allowlist"
+    echo "  ./tcpux block <ip>               move ip to blocklist"
+    echo "  ./tcpux get                      dump allowlist state"
+    ;;
+  *)
+    exec python3 "$HERE/client.py" "$@"
+    ;;
+esac
