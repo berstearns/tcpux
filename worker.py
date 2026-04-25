@@ -26,7 +26,15 @@ import argparse, json, os, shlex, socket, subprocess, sys, time
 from proto import rpc
 
 
-SHELL_CMDS = {"bash", "zsh", "fish", "sh", "dash", "tcsh", "ksh"}
+# Commands that count as "idle" for SK5 — i.e. send-keys is safe to dispatch
+# because the foreground process is interactive and accepts keystrokes as
+# input. Defaults to common shells plus `claude` (Claude Code CLI takes
+# typed prompts as input). Override at runtime with TCPUX_IDLE_CMDS as a
+# comma-separated list to add REPLs (`python`, `node`, `irb`, …).
+IDLE_CMDS = set(filter(None, os.environ.get(
+    "TCPUX_IDLE_CMDS",
+    "bash,zsh,fish,sh,dash,tcsh,ksh,claude"
+).split(",")))
 
 
 # ── tmux wrappers ───────────────────────────────────────────────
@@ -58,7 +66,7 @@ def list_panes():
             continue
         s, w, p, cmd, pid = parts
         pane_id = f"{s}:{w}:{p}"
-        panes[pane_id] = {"busy": cmd not in SHELL_CMDS, "cmd": cmd, "pid": pid}
+        panes[pane_id] = {"busy": cmd not in IDLE_CMDS, "cmd": cmd, "pid": pid}
     return panes
 
 

@@ -1,0 +1,1 @@
+../deploy/remote-worker.sh

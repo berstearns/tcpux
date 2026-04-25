@@ -102,17 +102,22 @@ if is_local; then
     echo -e "${DIM}[local] run $REMOTE_SCRIPT $REMOTE_ROOT${NC}"
     bash "$REMOTE_SCRIPT" "$REMOTE_ROOT"
 else
-    echo -e "${DIM}[ssh] scp bundle → $INSTANCE:/tmp/tcpux-bundle.tar.gz${NC}"
+    # Per-user remote temp paths so multiple SSH users don't collide on
+    # a shared /tmp (a stale root-owned bundle blocks claude-runner, etc.).
+    REMOTE_USER="${INSTANCE%%@*}"
+    REMOTE_BUNDLE="/tmp/tcpux-bundle-${REMOTE_USER}.tar.gz"
+    REMOTE_ENV="/tmp/tcpux-${REMOTE_USER}.env"
+    echo -e "${DIM}[ssh] scp bundle → $INSTANCE:$REMOTE_BUNDLE${NC}"
     "${SSH_WRAP[@]}" scp -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
-        "$BUNDLE" "$INSTANCE:/tmp/tcpux-bundle.tar.gz"
+        "$BUNDLE" "$INSTANCE:$REMOTE_BUNDLE"
     "${SSH_WRAP[@]}" scp -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
-        "$ENV_FILE" "$INSTANCE:/tmp/tcpux.env"
+        "$ENV_FILE" "$INSTANCE:$REMOTE_ENV"
     echo -e "${DIM}[ssh] pipe remote-$TYPE.sh${NC}"
     # Unpack and run the script on the target; pass install dir as $1.
     "${SSH_WRAP[@]}" ssh -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new "$INSTANCE" \
         "mkdir -p '$REMOTE_ROOT' && \
-         tar -xzf /tmp/tcpux-bundle.tar.gz -C '$REMOTE_ROOT' && \
-         mv /tmp/tcpux.env '$REMOTE_ROOT/.env' && \
+         tar -xzf '$REMOTE_BUNDLE' -C '$REMOTE_ROOT' && \
+         mv '$REMOTE_ENV' '$REMOTE_ROOT/.env' && \
          bash -s '$REMOTE_ROOT'" < "$REMOTE_SCRIPT"
 fi
 
