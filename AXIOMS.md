@@ -103,6 +103,49 @@ The queue server reads `TCPUX_ALLOWLIST_DB` (a JSON file maintained by
 If `TCPUX_ALLOWLIST_DB` is unset the gate is disabled (dev mode) and a
 warning is logged once. Production deploys must set it.
 
+## Shortcuts (worker:pane aliases)
+
+A small global namespace mapping a name to a (worker, pane) tuple, so
+`./tcpux -w X -p Y -c '…'` can shorten to `./tcpux -s b -c '…'`.
+
+State:
+
+    SHORTCUTS : NAME ⇀ { worker : WORKER_ID, pane : PANE_ID, created_at : ℝ }
+
+Persisted to `TCPUX_SHORTCUTS_DB` (atomic write, mtime-cache reload —
+same lifecycle as the allowlist db). If the env var is unset, shortcuts
+are in-memory only and lost on restart.
+
+### SH — `shortcut-set`
+
+| # | axiom | err_code |
+|---|---|---|
+| SH1 | name matches `[A-Za-z0-9_-]{1,32}` | `SH1_BAD_NAME` |
+| SH2 | worker registered | `SH2_BAD_WORKER_ID` / `SH2_WORKER_UNKNOWN` |
+| SH3 | pane matches PANE_ID and ∈ STATE[worker].panes | `SH3_BAD_PANE_ID` / `SH3_PANE_NOT_EXIST` |
+| SH4 | name ∉ SHORTCUTS unless `force=true` | `SH4_NAME_TAKEN` |
+
+Validation runs at write time only. A worker dying invalidates the
+target silently — but the next `send-keys` through the shortcut hits
+SK3 and fails honestly (see SK0 below).
+
+### SHD — `shortcut-del`
+
+| # | axiom | err_code |
+|---|---|---|
+| SHD1 | name ∈ SHORTCUTS | `SHD1_UNKNOWN` |
+
+### SK0 — send-keys target resolver (precondition for SK1–5)
+
+`send-keys` accepts either `pane` (with `worker`) or `shortcut`, never both.
+
+| # | axiom | err_code |
+|---|---|---|
+| SK0a | exactly one of `{pane, shortcut}` is set | `SK0_AMBIGUOUS` / `SK0_NO_TARGET` |
+| SK0b | if `shortcut` set, must ∈ SHORTCUTS | `SK0_SHORTCUT_UNKNOWN` |
+
+After SK0, the (worker, pane) tuple is determined and SK1–5 run unchanged.
+
 ## Allowlist reducer (redux-style)
 
 The allowlist itself is a pure reducer with two single-entrypoint actions:

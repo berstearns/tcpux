@@ -21,7 +21,7 @@ On success the op either mutates STATE (tmux-panes-update) or gets
 enqueued for the worker. On failure the server responds with a stable
 error code so the sender can cascade programmatically.
 """
-import asyncio, itertools, os, time
+import asyncio, itertools, json, os, time
 from collections import deque
 
 import axioms, allowlist
@@ -37,12 +37,52 @@ def _req_env(name):
 
 HOST = os.environ.get("TCPUX_HOST", "0.0.0.0")
 PORT = int(_req_env("TCPUX_PORT"))
-ALLOWLIST_DB = os.environ.get("TCPUX_ALLOWLIST_DB", "")
+ALLOWLIST_DB  = os.environ.get("TCPUX_ALLOWLIST_DB",  "")
+SHORTCUTS_DB  = os.environ.get("TCPUX_SHORTCUTS_DB",  "")
 
 STATE       = {}   # worker_id → worker record
 QUEUE       = {}   # worker_id → deque[command]
 DISPATCHED  = {}   # cmd_id    → {"worker","op","result"}
+SHORTCUTS   = {}   # name      → {"worker","pane","created_at"}
 _ID_COUNTER = itertools.count(1)
+
+
+# ── Shortcuts persistence (atomic write, mtime-cache reload) ─────
+# Mirrors the allowlist file lifecycle: on every mutation we write the
+# whole dict atomically; on every read we reload only if the file's
+# mtime changed. If TCPUX_SHORTCUTS_DB is unset, shortcuts are
+# in-memory only (lost on restart).
+
+_SC_MTIME = [None]
+
+
+def _shortcuts_load():
+    if not SHORTCUTS_DB or not os.path.isfile(SHORTCUTS_DB):
+        return
+    try:
+        mt = os.path.getmtime(SHORTCUTS_DB)
+    except OSError:
+        return
+    if _SC_MTIME[0] == mt:
+        return
+    with open(SHORTCUTS_DB) as f:
+        data = json.load(f)
+    SHORTCUTS.clear()
+    SHORTCUTS.update(data.get("shortcuts", {}))
+    _SC_MTIME[0] = mt
+
+
+def _shortcuts_save():
+    if not SHORTCUTS_DB:
+        return
+    os.makedirs(os.path.dirname(SHORTCUTS_DB) or ".", exist_ok=True)
+    tmp = SHORTCUTS_DB + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"shortcuts": SHORTCUTS, "updated_at": time.time()},
+                  f, indent=2, sort_keys=True)
+    os.replace(tmp, SHORTCUTS_DB)
+    try: _SC_MTIME[0] = os.path.getmtime(SHORTCUTS_DB)
+    except OSError: pass
 
 
 # ── Colors + log ────────────────────────────────────────────────
@@ -55,6 +95,7 @@ OP_COLORS = {
     "tmux-panes-update": "blue", "send-keys": "green", "poll": "cyan",
     "ack": "magenta", "create-session": "yellow", "create-window": "yellow",
     "create-pane": "yellow", "state": "dim",
+    "shortcut-set": "magenta", "shortcut-del": "magenta", "shortcut-list": "dim",
 }
 
 
@@ -159,9 +200,13 @@ def _op_panes_update(msg, addr):
 
 def _op_send_keys(msg, addr):
     op = "send-keys"
-    worker_id = msg.get("worker")
-    pane_id   = msg.get("pane")
-    cmd       = msg.get("cmd")
+    cmd = msg.get("cmd")
+    _shortcuts_load()
+    # Resolve target — either direct (worker, pane) or via shortcut name.
+    worker_id, pane_id, (rok, rcode, rhint) = axioms.resolve_send_keys_target(SHORTCUTS, msg)
+    if not rok:
+        return _reject(rcode, rhint, op, addr)
+    via = f" {C['dim']}(via {msg.get('shortcut')!r}){C['reset']}" if msg.get("shortcut") else ""
     ok, code, hint = axioms.check_send_keys(STATE, worker_id, pane_id, cmd)
     if not ok: return _reject(code, hint, op, addr)
     pane = STATE[worker_id]["panes"][pane_id]
@@ -171,7 +216,7 @@ def _op_send_keys(msg, addr):
                        op, addr)
     c = _enqueue(worker_id, op, pane=pane_id, cmd=cmd)
     log("INF", op, f"{C['bold']}#{c['id']}{C['reset']} → "
-                   f"{C['cyan']}{worker_id}{C['reset']}/{pane_id} "
+                   f"{C['cyan']}{worker_id}{C['reset']}/{pane_id}{via} "
                    f"{C['dim']}{cmd[:50]}{C['reset']}", addr)
     return {"ok": True, "id": c["id"]}
 
@@ -247,6 +292,44 @@ def _op_status(msg, addr):
     return {"ok": True, **d}
 
 
+# ── Shortcut ops (set / del / list) ─────────────────────────────
+
+def _op_shortcut_set(msg, addr):
+    op = "shortcut-set"
+    _shortcuts_load()
+    name      = msg.get("name")
+    worker_id = msg.get("worker")
+    pane_id   = msg.get("pane")
+    force     = bool(msg.get("force", False))
+    ok, code, hint = axioms.check_shortcut_set(STATE, SHORTCUTS, name, worker_id, pane_id, force)
+    if not ok: return _reject(code, hint, op, addr)
+    overwriting = name in SHORTCUTS
+    SHORTCUTS[name] = {"worker": worker_id, "pane": pane_id, "created_at": time.time()}
+    _shortcuts_save()
+    verb = "overwrote" if overwriting else "set"
+    log("INF", op, f"{verb} {C['bold']}{name}{C['reset']} → "
+                   f"{C['cyan']}{worker_id}{C['reset']}/{pane_id}", addr)
+    return {"ok": True, "name": name, "shortcut": SHORTCUTS[name]}
+
+
+def _op_shortcut_del(msg, addr):
+    op = "shortcut-del"
+    _shortcuts_load()
+    name = msg.get("name")
+    ok, code, hint = axioms.check_shortcut_del(SHORTCUTS, name)
+    if not ok: return _reject(code, hint, op, addr)
+    removed = SHORTCUTS.pop(name)
+    _shortcuts_save()
+    log("INF", op, f"removed {C['bold']}{name}{C['reset']} "
+                   f"{C['dim']}(was → {removed['worker']}/{removed['pane']}){C['reset']}", addr)
+    return {"ok": True, "name": name, "was": removed}
+
+
+def _op_shortcut_list(msg, addr):
+    _shortcuts_load()
+    return {"ok": True, "shortcuts": SHORTCUTS}
+
+
 OPS = {
     "tmux-panes-update": _op_panes_update,
     "send-keys":         _op_send_keys,
@@ -257,6 +340,9 @@ OPS = {
     "ack":               _op_ack,
     "state":             _op_state,
     "status":            _op_status,
+    "shortcut-set":      _op_shortcut_set,
+    "shortcut-del":      _op_shortcut_del,
+    "shortcut-list":     _op_shortcut_list,
 }
 
 

@@ -130,9 +130,12 @@ def send_keys(host, port, worker, pane, cmd, cascade, wait):
 
 def main():
     ap = argparse.ArgumentParser(description="tcpux client")
-    ap.add_argument("-w", "--worker", required=True, help="target worker id")
+    ap.add_argument("-w", "--worker", help="target worker id (or use -s)")
     ap.add_argument("-p", "--pane",   help="target pane (session:window:pane)")
+    ap.add_argument("-s", "--shortcut", help="shortcut name resolving to (worker, pane)")
     ap.add_argument("-c", "--cmd",    help="command to send-keys into the pane")
+    ap.add_argument("-n", "--name",   help="shortcut name for shortcut-{set,del}")
+    ap.add_argument("--force", action="store_true", help="overwrite existing shortcut on -set")
     ap.add_argument("--host",  default=os.environ.get("TCPUX_HOST", "127.0.0.1"))
     _p = os.environ.get("TCPUX_PORT")
     ap.add_argument("--port",  type=int, default=int(_p) if _p else None)
@@ -141,7 +144,8 @@ def main():
     ap.add_argument("--wait",  type=float, default=30.0,
                     help="seconds to wait for created panes to appear")
     ap.add_argument("--op",    choices=["send-keys", "create-pane", "create-window",
-                                         "create-session", "state", "status"],
+                                         "create-session", "state", "status",
+                                         "shortcut-set", "shortcut-del", "shortcut-list"],
                     default="send-keys")
     ap.add_argument("--session", help="session id for create-session / create-window")
     ap.add_argument("--window",  help="window id for create-window")
@@ -151,10 +155,25 @@ def main():
         ap.error("--port required (or set TCPUX_PORT in env)")
 
     if args.op == "send-keys":
-        if not args.pane or not args.cmd:
-            ap.error("--pane and --cmd required for send-keys")
-        r = send_keys(args.host, args.port, args.worker, args.pane, args.cmd,
-                      cascade=not args.no_cascade, wait=args.wait)
+        if not args.cmd:
+            ap.error("--cmd required for send-keys")
+        if args.shortcut and (args.worker or args.pane):
+            # Forward both fields so the server's SK0_AMBIGUOUS axiom fires —
+            # the server is the source of truth on target resolution.
+            r = rpc(args.host, args.port,
+                    {"op": "send-keys", "shortcut": args.shortcut,
+                     "worker": args.worker, "pane": args.pane, "cmd": args.cmd})
+        elif args.shortcut:
+            # Shortcut-only path. Cascade is skipped: a shortcut IS the
+            # contract — if (worker, pane) is stale, fix the shortcut, don't
+            # silently rebuild a window-pane elsewhere.
+            r = rpc(args.host, args.port,
+                    {"op": "send-keys", "shortcut": args.shortcut, "cmd": args.cmd})
+        else:
+            if not args.worker or not args.pane:
+                ap.error("--worker and --pane (or --shortcut) required for send-keys")
+            r = send_keys(args.host, args.port, args.worker, args.pane, args.cmd,
+                          cascade=not args.no_cascade, wait=args.wait)
     elif args.op == "create-pane":
         r = rpc(args.host, args.port,
                 {"op": "create-pane", "worker": args.worker, "pane": args.pane})
@@ -169,6 +188,18 @@ def main():
         r = rpc(args.host, args.port, {"op": "state"})
     elif args.op == "status":
         r = rpc(args.host, args.port, {"op": "status", "id": args.id})
+    elif args.op == "shortcut-set":
+        if not args.name or not args.worker or not args.pane:
+            ap.error("--name, --worker, --pane required for shortcut-set")
+        r = rpc(args.host, args.port,
+                {"op": "shortcut-set", "name": args.name,
+                 "worker": args.worker, "pane": args.pane, "force": args.force})
+    elif args.op == "shortcut-del":
+        if not args.name:
+            ap.error("--name required for shortcut-del")
+        r = rpc(args.host, args.port, {"op": "shortcut-del", "name": args.name})
+    elif args.op == "shortcut-list":
+        r = rpc(args.host, args.port, {"op": "shortcut-list"})
     else:
         r = {"ok": False, "err": "unknown op"}
 

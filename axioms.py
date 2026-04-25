@@ -150,3 +150,67 @@ def check_ack(queue_index, cmd_id):
     if not isinstance(cmd_id, int) or cmd_id not in queue_index:
         return _fail("A1_UNKNOWN_CMD", f"cmd_id {cmd_id} not dispatched")
     return OK
+
+
+# ── SH: shortcut-set / shortcut-del ─────────────────────────────
+# Shortcuts map a short opaque name to a (worker, pane) tuple. The
+# namespace is global. Mutations are validated against the live STATE
+# at write time; they are NOT revalidated on read — a stale shortcut
+# falls through to SK3 at send-keys time, which is the canonical safety
+# net.
+
+SHORTCUT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+def check_shortcut_set(state, shortcuts, name, worker_id, pane_id, force):
+    if not isinstance(name, str) or not SHORTCUT_NAME_RE.match(name):
+        return _fail("SH1_BAD_NAME", "name must match [A-Za-z0-9_-]{1,32}")
+    if not isinstance(worker_id, str) or not IDENT_RE.match(worker_id):
+        return _fail("SH2_BAD_WORKER_ID", "worker_id must match [A-Za-z0-9_-]+")
+    if worker_id not in state:
+        return _fail("SH2_WORKER_UNKNOWN",
+                     "worker has not sent tmux-panes-update yet")
+    if not isinstance(pane_id, str) or not PANE_ID_RE.match(pane_id):
+        return _fail("SH3_BAD_PANE_ID", "pane must match session:window:pane")
+    panes = state[worker_id].get("panes", {})
+    if pane_id not in panes:
+        return _fail("SH3_PANE_NOT_EXIST",
+                     f"pane {pane_id} not in worker's current pane set")
+    if not force and name in shortcuts:
+        return _fail("SH4_NAME_TAKEN",
+                     f"shortcut {name!r} already exists — pass force to overwrite")
+    return OK
+
+
+def check_shortcut_del(shortcuts, name):
+    if not isinstance(name, str) or not SHORTCUT_NAME_RE.match(name):
+        return _fail("SHD1_BAD_NAME", "name must match [A-Za-z0-9_-]{1,32}")
+    if name not in shortcuts:
+        return _fail("SHD1_UNKNOWN", f"shortcut {name!r} not found")
+    return OK
+
+
+# ── SK0: send-keys target resolution (shortcut OR pane, not both) ───────
+
+def resolve_send_keys_target(shortcuts, msg):
+    """Return (worker, pane, err) — exactly one of {shortcut, pane} must be set.
+
+    Used by server.py before applying SK1-5. Keeps SK1-5 unchanged: they
+    operate on (worker, pane) regardless of how the target was specified.
+    """
+    has_pane     = bool(msg.get("pane"))
+    has_shortcut = bool(msg.get("shortcut"))
+    if has_pane and has_shortcut:
+        return (None, None, _fail("SK0_AMBIGUOUS",
+                "specify exactly one of pane or shortcut, not both"))
+    if not has_pane and not has_shortcut:
+        return (None, None, _fail("SK0_NO_TARGET",
+                "send-keys requires pane or shortcut"))
+    if has_shortcut:
+        name = msg["shortcut"]
+        s = shortcuts.get(name)
+        if not s:
+            return (None, None, _fail("SK0_SHORTCUT_UNKNOWN",
+                    f"shortcut {name!r} not registered"))
+        return (s["worker"], s["pane"], OK)
+    return (msg.get("worker"), msg["pane"], OK)
